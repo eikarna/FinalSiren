@@ -88,6 +88,7 @@ async fn main(req: Request, env: Env, _: Context) -> Result<Response> {
 
     Router::with_data(config)
         .on_async("/check", check)
+        .on_async("/check/single", check_single)
         .on_async("/", fe)
         .on_async("/sub", sub)
         .on_async("/link", link)
@@ -293,6 +294,57 @@ async fn check(req: Request, cx: RouteContext<Config>) -> Result<Response> {
         "alive": alive,
         "results": results,
     }))
+}
+
+/// `GET /check/single` — probe ONE arbitrary `ip:port` (or `host:port`) for
+/// TCP-connect liveness. Unlike `/check` (a batch sweep over the KV relay
+/// list), this takes a specific target so the link/sub pages can ask
+/// "is *this* proxy reachable?".
+///
+/// Query parameters:
+/// - `target` : `ip:port` (or `[ipv6]:port`). Preferred form.
+/// - `ip`     : host/ip, used together with `port` as an alternative to `target`.
+/// - `port`   : port number, paired with `ip`.
+/// - `timeout`: connect deadline in ms (default 3000, min 500).
+///
+/// Returns `{ addr, port, alive, latency_ms }`.
+async fn check_single(req: Request, _: RouteContext<Config>) -> Result<Response> {
+    let query: HashMap<String, String> = req
+        .url()?
+        .query_pairs()
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+
+    let timeout_ms = query
+        .get("timeout")
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(3000)
+        .max(500);
+
+    // Accept either `?target=ip:port` or `?ip=host&port=N`.
+    let target_str = match query.get("target") {
+        Some(t) => t.clone(),
+        None => match (query.get("ip"), query.get("port")) {
+            (Some(ip), Some(port)) => format!("{}:{}", ip, port),
+            _ => {
+                return Response::from_json(&serde_json::json!({
+                    "alive": false,
+                    "error": "missing target; use ?target=ip:port or ?ip=&port="
+                }));
+            }
+        },
+    };
+
+    match parse_target(&target_str) {
+        Some(target) => {
+            let result = probe(target, timeout_ms).await;
+            Response::from_json(&result)
+        }
+        None => Response::from_json(&serde_json::json!({
+            "alive": false,
+            "error": format!("invalid target '{}'; expected ip:port", target_str),
+        })),
+    }
 }
 
 async fn tunnel(req: Request, mut cx: RouteContext<Config>) -> Result<Response> {
