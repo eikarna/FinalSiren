@@ -1260,10 +1260,13 @@ dependencies = [
  "pin-project-lite",
  "regex",
  "reqwest",
+ "serde",
  "serde_json",
  "sha2",
  "tokio",
  "uuid",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
  "worker",
 ]
 

@@ -14,6 +14,39 @@ use regex::Regex;
 static PROXYIP_PATTERN: Lazy<Regex> = Lazy::new(|| Regex::new(r"^.+-\d+$").unwrap());
 static PROXYKV_PATTERN: Lazy<Regex> = Lazy::new(|| Regex::new(r"^([A-Z]{2})").unwrap());
 
+/// URL of the upstream `proxy_kv` relay list, cached in the `SIREN` KV namespace.
+static PROXY_KV_URL: &str =
+    "https://raw.githubusercontent.com/FoolVPN-ID/Nautica/refs/heads/main/kvProxyList.json";
+
+/// Load the `proxy_kv` map (`{ "CC": ["ip:port", ...] }`) from the `SIREN` KV
+/// namespace, populating it from GitHub on a cache miss. Shared by the tunnel
+/// handler and the `/check` liveness endpoint so they always see the same list.
+async fn load_proxy_kv(kv: &worker::kv::KvStore) -> Result<HashMap<String, Vec<String>>> {
+    let cached = kv.get("proxy_kv").text().await?;
+    let proxy_kv_str = match cached {
+        Some(s) if !s.is_empty() => s,
+        _ => {
+            console_log!("getting proxy kv from github...");
+            let req = Fetch::Url(Url::parse(PROXY_KV_URL)?);
+            let mut res = req.send().await?;
+            if res.status_code() != 200 {
+                return Err(Error::from(format!(
+                    "error getting proxy kv: {}",
+                    res.status_code()
+                )));
+            }
+            let body = res.text().await?.to_string();
+            kv.put("proxy_kv", &body)?
+                .expiration_ttl(60 * 60 * 24)
+                .execute()
+                .await?;
+            body
+        }
+    };
+
+    Ok(serde_json::from_str(&proxy_kv_str)?)
+}
+
 // Base URL for GitHub raw content
 static GITHUB_BASE_URL: &str = "https://raw.githubusercontent.com/eikarna/SirenWeb/refs/heads/main";
 
@@ -52,6 +85,7 @@ async fn main(req: Request, env: Env, _: Context) -> Result<Response> {
     }
 
     Router::with_data(config)
+        .on_async("/check", check)
         .on_async("/", fe)
         .on_async("/sub", sub)
         .on_async("/link", link)
@@ -157,6 +191,103 @@ async fn converter(_: Request, cx: RouteContext<Config>) -> Result<Response> {
     get_response_from_url(cx.data.converter_page_url.clone()).await
 }
 
+/// `GET /check` — probe proxy relays for liveness and return a JSON report.
+///
+/// Query parameters:
+/// - `cc`    : restrict the sweep to a single country code (e.g. `ID`). When
+///             omitted, relays are drawn from all countries.
+/// - `limit` : max number of relays to probe in this request (default 20, hard
+///             cap 50). Guards against exceeding Workers CPU/wall budgets.
+/// - `timeout`: per-relay connect deadline in ms (default 3000).
+///
+/// Returns `{ "checked", "alive", "results": [{ addr, port, alive, latency_ms }] }`.
+async fn check(req: Request, cx: RouteContext<Config>) -> Result<Response> {
+    let query: HashMap<String, String> = req
+        .url()?
+        .query_pairs()
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+
+    let cc = query.get("cc").map(|s| s.to_uppercase());
+    let limit = query
+        .get("limit")
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(20)
+        .min(50)
+        .max(1);
+    let timeout_ms = query
+        .get("timeout")
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(3000)
+        .max(500);
+
+    let kv = cx.kv("SIREN")?;
+    let proxy_kv = load_proxy_kv(&kv).await?;
+
+    // Collect candidate relay entries from the requested countries.
+    let entries: Vec<String> = match &cc {
+        Some(code) => proxy_kv
+            .get(code)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .take(limit)
+            .collect(),
+        None => {
+            // Round-robin across countries so the sweep samples breadth-first
+            // instead of draining one country entirely before the next.
+            let columns: Vec<&Vec<String>> = proxy_kv.values().collect();
+            let mut picked = Vec::new();
+            let mut i = 0;
+            while picked.len() < limit {
+                let mut progressed = false;
+                for col in &columns {
+                    if i < col.len() {
+                        picked.push(col[i].clone());
+                        progressed = true;
+                        if picked.len() >= limit {
+                            break;
+                        }
+                    }
+                }
+                if !progressed {
+                    break;
+                }
+                i += 1;
+            }
+            picked
+        }
+    };
+
+    let targets: Vec<Target> = entries
+        .iter()
+        .filter_map(|raw| parse_target(raw))
+        .collect();
+
+    if targets.is_empty() {
+        return Response::from_json(&serde_json::json!({
+            "checked": 0,
+            "alive": 0,
+            "results": Vec::<ProbeResult>::new(),
+            "note": match &cc {
+                Some(code) => format!("no relays found for country code '{}'", code),
+                None => "no relays available".to_string(),
+            }
+        }));
+    }
+
+    // Bounded concurrency: 8 in-flight connects keeps us within Workers'
+    // outbound-socket guidance while still parallelizing the sweep.
+    let results = probe_all(targets, 8, timeout_ms).await;
+    let alive = results.iter().filter(|r| r.alive).count();
+
+    Response::from_json(&serde_json::json!({
+        "checked": results.len(),
+        "alive": alive,
+        "results": results,
+    }))
+}
+
 async fn tunnel(req: Request, mut cx: RouteContext<Config>) -> Result<Response> {
     let mut proxyip = match cx.param("proxyip") {
         Some(p) => p.to_string(),
@@ -165,23 +296,9 @@ async fn tunnel(req: Request, mut cx: RouteContext<Config>) -> Result<Response> 
     if PROXYKV_PATTERN.is_match(&proxyip) {
         let kvid_list: Vec<String> = proxyip.split(",").map(|s| s.to_string()).collect();
         let kv = cx.kv("SIREN")?;
-        let mut proxy_kv_str = kv.get("proxy_kv").text().await?.unwrap_or("".to_string());
+        let proxy_kv = load_proxy_kv(&kv).await?;
         let mut rand_buf = [0u8, 1];
         getrandom::getrandom(&mut rand_buf).expect("failed generating random number");
-
-        if proxy_kv_str.is_empty() {
-            console_log!("getting proxy kv from github...");
-            let req = Fetch::Url(Url::parse("https://raw.githubusercontent.com/FoolVPN-ID/Nautica/refs/heads/main/kvProxyList.json")?);
-            let mut res = req.send().await?;
-            if res.status_code() == 200 {
-                proxy_kv_str = res.text().await?.to_string();
-                kv.put("proxy_kv", &proxy_kv_str)?.expiration_ttl(60 * 60 * 24).execute().await?;
-            } else {
-                return Err(Error::from(format!("error getting proxy kv: {}", res.status_code())));
-            }
-        }
-
-        let proxy_kv: HashMap<String, Vec<String>> = serde_json::from_str(&proxy_kv_str)?;
 
         let kv_index = (rand_buf[0] as usize) % kvid_list.len();
         proxyip = kvid_list[kv_index].clone();
