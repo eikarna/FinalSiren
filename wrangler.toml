@@ -72,6 +72,7 @@ MAIN_PAGE_URL = "https://raw.githubusercontent.com/eikarna/SirenWeb/refs/heads/m
 SUB_PAGE_URL = "https://raw.githubusercontent.com/eikarna/SirenWeb/refs/heads/main/sub.html"
 LINK_PAGE_URL = "https://raw.githubusercontent.com/eikarna/SirenWeb/refs/heads/main/link.html"
 CONVERTER_PAGE_URL = "https://raw.githubusercontent.com/eikarna/SirenWeb/refs/heads/main/converter.html"
+CHECKER_PAGE_URL = "https://raw.githubusercontent.com/eikarna/SirenWeb/refs/heads/main/check.html"
 
 [observability.logs]
 enabled = true
