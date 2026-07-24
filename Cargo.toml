@@ -43,4 +43,4 @@ codegen-units = 1
 panic = "abort"
 
 [package.metadata.wasm-pack.profile.release]
-wasm-opt = true
+wasm-opt = false
