@@ -97,6 +97,9 @@ impl<'a> ProxyStream<'a> {
             .map_err(|e| {
                 Error::RustError(e.to_string())
             })?;
+        // Promptly close the remote socket to release the connection quickly,
+        // reducing overhead on the Workers runtime.
+        let _ = remote_socket.close().await;
         Ok(())
     }
 

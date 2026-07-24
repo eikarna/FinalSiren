@@ -206,7 +206,7 @@ async fn checker(_: Request, cx: RouteContext<Config>) -> Result<Response> {
 ///             omitted, relays are drawn from all countries.
 /// - `limit` : max number of relays to probe in this request (default 20, hard
 ///             cap 50). Guards against exceeding Workers CPU/wall budgets.
-/// - `timeout`: per-relay connect deadline in ms (default 3000).
+/// - `timeout`: per-relay connect deadline in ms (default 2000, lower for faster sweep).
 ///
 /// Returns `{ "checked", "alive", "results": [{ addr, port, alive, latency_ms }] }`.
 async fn check(req: Request, cx: RouteContext<Config>) -> Result<Response> {
@@ -226,7 +226,7 @@ async fn check(req: Request, cx: RouteContext<Config>) -> Result<Response> {
     let timeout_ms = query
         .get("timeout")
         .and_then(|s| s.parse::<u32>().ok())
-        .unwrap_or(3000)
+        .unwrap_or(2000)
         .max(500);
 
     let kv = cx.kv("SIREN")?;
@@ -305,7 +305,7 @@ async fn check(req: Request, cx: RouteContext<Config>) -> Result<Response> {
 /// - `target` : `ip:port` (or `[ipv6]:port`). Preferred form.
 /// - `ip`     : host/ip, used together with `port` as an alternative to `target`.
 /// - `port`   : port number, paired with `ip`.
-/// - `timeout`: connect deadline in ms (default 3000, min 500).
+/// - `timeout`: connect deadline in ms (default 2000, min 500).
 ///
 /// Returns `{ addr, port, alive, latency_ms }`.
 async fn check_single(req: Request, _: RouteContext<Config>) -> Result<Response> {
@@ -318,7 +318,7 @@ async fn check_single(req: Request, _: RouteContext<Config>) -> Result<Response>
     let timeout_ms = query
         .get("timeout")
         .and_then(|s| s.parse::<u32>().ok())
-        .unwrap_or(3000)
+        .unwrap_or(2000)
         .max(500);
 
     // Accept either `?target=ip:port` or `?ip=host&port=N`.

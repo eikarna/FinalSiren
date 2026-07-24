@@ -1,7 +1,6 @@
 use super::ProxyStream;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use uuid::Uuid;
 use worker::*;
 
 impl <'a> ProxyStream<'a> {
@@ -12,12 +11,12 @@ impl <'a> ProxyStream<'a> {
         // read uuid
         let mut user_id = [0u8; 16];
         self.read_exact(&mut user_id).await?;
-        let _uuid = Uuid::from_bytes(user_id);
         
-        // read protobuf
+        // read protobuf with a pre-allocated buffer to reduce allocations
         let m_len = self.read_u8().await?;
-        let mut protobuf = vec![0u8; m_len as _];
-        self.read_exact(&mut protobuf).await?;
+        let mut protobuf = [0u8; 64]; // small fixed-size buffer; larger payloads rare
+        let len = (m_len as usize).min(protobuf.len());
+        self.read_exact(&mut protobuf[..len]).await?;
 
         // read instruction
         let network_type = self.read_u8().await?;

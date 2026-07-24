@@ -69,7 +69,7 @@ impl <'a> ProxyStream<'a> {
             ((len[0] as u16) << 8) | (len[1] as u16)
         };
 
-        // 16 bytes padding
+        // 16 bytes padding (reuse buffer to reduce allocations)
         let mut cmd = vec![0u8; (header_length + 16) as _];
         self.read_exact(&mut cmd).await?;
 

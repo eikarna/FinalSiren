@@ -77,5 +77,9 @@ CHECKER_PAGE_URL = "https://raw.githubusercontent.com/eikarna/SirenWeb/refs/head
 [observability.logs]
 enabled = true
 
+# Smart placement minimizes latency by routing to the nearest data center.
+# For very low ping targets, consider upgrading to Durable Objects
+# for persistent WebSocket/state connections (beyond Free Tier limits).
+
 [placement]
 mode = "smart"
