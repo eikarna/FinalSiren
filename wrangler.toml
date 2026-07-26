@@ -49,6 +49,14 @@ routes = [
   { pattern = "link.quipper.com.free.kazu.qzz.io", custom_domain = true },
   { pattern = "learning.polibatam.ac.id.free.kazu.qzz.io", custom_domain = true },
   { pattern = "ikado.ac.id.free.kazu.qzz.io", custom_domain = true },
+  { pattern = "listen.noice.id.free.kazu.qzz.io", custom_domain = true },
+  { pattern = "api.visionplus.id.free.kazu.qzz.io", custom_domain = true },
+  { pattern = "partner.catchplay.com.free.kazu.qzz.io", custom_domain = true },
+  { pattern = "opensource.fb.com.free.kazu.qzz.io", custom_domain = true },
+  { pattern = "graph.facobook.com.free.kazu.qzz.io", custom_domain = true },
+  { pattern = "status.fb.com.free.kazu.qzz.io", custom_domain = true },
+  { pattern = "clicks.artists.spotify.com.free.kazu.qzz.io", custom_domain = true },
+  { pattern = "testcdn.spotify.com.free.kazu.qzz.io", custom_domain = true },
 
   # Placeholder
   # { pattern = ".free.kazu.qzz.io", custom_domain = true },
