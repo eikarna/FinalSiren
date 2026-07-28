@@ -82,8 +82,9 @@ LINK_PAGE_URL = "https://raw.githubusercontent.com/eikarna/SirenWeb/refs/heads/m
 CONVERTER_PAGE_URL = "https://raw.githubusercontent.com/eikarna/SirenWeb/refs/heads/main/converter.html"
 CHECKER_PAGE_URL = "https://raw.githubusercontent.com/eikarna/SirenWeb/refs/heads/main/check.html"
 
-[observability.logs]
-enabled = true
+# Disable observability to avoid limits 
+# [observability.logs]
+# enabled = true
 
 # Smart placement minimizes latency by routing to the nearest data center.
 # For very low ping targets, consider upgrading to Durable Objects
