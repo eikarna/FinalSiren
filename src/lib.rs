@@ -228,8 +228,11 @@ async fn check(req: Request, cx: RouteContext<Config>) -> Result<Response> {
         .unwrap_or(2000)
         .max(500);
 
-    let kv = cx.kv("SIREN")?;
-    let proxy_kv = load_proxy_kv(&kv).await?;
+    let kv_res = cx.kv("SIREN");
+    let proxy_kv = match kv_res {
+        Ok(kv) => load_proxy_kv(&kv).await.unwrap_or_default(),
+        Err(_) => HashMap::new(),
+    };
 
     let entries: Vec<String> = match &cc {
         Some(code) if code != "ALL" => proxy_kv
