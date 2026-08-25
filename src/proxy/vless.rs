@@ -3,49 +3,54 @@ use super::ProxyStream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use worker::*;
 
-impl <'a> ProxyStream<'a> {
+impl<'a> ProxyStream<'a> {
     pub async fn process_vless(&mut self) -> Result<()> {
-        // ignore version
-        self.read_u8().await?;
-        
-        // read uuid
+        // Version (1 byte)
+        let _version = self.read_u8().await?;
+
+        // User UUID (16 bytes)
         let mut user_id = [0u8; 16];
         self.read_exact(&mut user_id).await?;
-        
-        // read protobuf with a pre-allocated buffer to reduce allocations
-        let m_len = self.read_u8().await?;
-        let mut protobuf = [0u8; 64]; // small fixed-size buffer; larger payloads rare
-        let len = (m_len as usize).min(protobuf.len());
-        self.read_exact(&mut protobuf[..len]).await?;
 
-        // read instruction
+        // Addons / protobuf (1 byte len + N bytes)
+        let m_len = self.read_u8().await?;
+        if m_len > 0 {
+            let mut protobuf = vec![0u8; m_len as usize];
+            self.read_exact(&mut protobuf).await?;
+        }
+
+        // Command / Instruction (1: TCP, 2: UDP, 3: Mux)
         let network_type = self.read_u8().await?;
         let is_tcp = network_type == 1;
 
-        // read port and address
+        // Port (2 bytes big endian)
         let remote_port = {
             let mut port = [0u8; 2];
             self.read_exact(&mut port).await?;
             ((port[0] as u16) << 8) | (port[1] as u16)
         };
+
+        // Destination address
         let remote_addr = crate::common::parse_addr(self).await?;
 
         if is_tcp {
-            let addr_pool = [
-                (remote_addr.clone(), remote_port),
-                (self.config.proxy_addr.clone(), self.config.proxy_port)
-            ];
+            // Write VLESS response header (version 0, addon length 0)
+            self.write_all(&[0u8, 0u8]).await?;
 
-            // send header
-            self.write(&[0u8; 2]).await?;
-            for (target_addr, target_port) in addr_pool {
-                if let Err(e) = self.handle_tcp_outbound(target_addr, target_port).await {
-                    console_error!("error handling tcp: {}", e)
-                }
+            // Relay out: if proxy_addr is configured, route via proxy relay;
+            // otherwise route directly to target address.
+            let (target_addr, target_port) = if !self.config.proxy_addr.is_empty() {
+                (self.config.proxy_addr.clone(), self.config.proxy_port)
+            } else {
+                (remote_addr, remote_port)
+            };
+
+            if let Err(e) = self.handle_tcp_outbound(target_addr, target_port).await {
+                console_error!("error handling tcp outbound: {}", e);
             }
         } else {
             if let Err(e) = self.handle_udp_outbound().await {
-                console_error!("error handling udp: {}", e)
+                console_error!("error handling udp outbound: {}", e);
             }
         }
 

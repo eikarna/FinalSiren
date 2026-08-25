@@ -21,7 +21,7 @@ pin_project! {
 
 impl<'a> ProxyStream<'a> {
     pub fn new(config: Config, ws: &'a WebSocket, events: EventStream<'a>) -> Self {
-        let buffer = BytesMut::new();
+        let buffer = BytesMut::with_capacity(4096);
 
         Self {
             config,
@@ -65,40 +65,42 @@ impl<'a> ProxyStream<'a> {
         self.fill_buffer_until(62).await?;
         let peeked_buffer = self.peek_buffer(62);
 
+        if peeked_buffer.is_empty() {
+            return Err(Error::RustError("empty payload buffer".to_string()));
+        }
+
         if peeked_buffer[0] == 0 {
             console_log!("VLESS detected!");
             self.process_vless().await
         } else if peeked_buffer[0] == 1 || peeked_buffer[0] == 3 {
             console_log!("Shadowsocks detected!");
             self.process_shadowsocks().await
-        } else if peeked_buffer[56] == 13 && peeked_buffer[57] == 10 {
+        } else if peeked_buffer.len() > 57 && peeked_buffer[56] == 13 && peeked_buffer[57] == 10 {
             console_log!("Trojan detected!");
             self.process_trojan().await
         } else {
             console_log!("Vmess detected!");
             self.process_vmess().await
         }
-
     }
 
     pub async fn handle_tcp_outbound(&mut self, addr: String, port: u16) -> Result<()> {
-        console_log!("connecting to upstream {}:{}", addr, port);
+        console_log!("forwarding outbound via relay {}:{}", addr, port);
 
-        let mut remote_socket = Socket::builder().connect(addr, port).map_err(|e| {
-            Error::RustError(e.to_string())
+        let mut remote_socket = Socket::builder().connect(addr.clone(), port).map_err(|e| {
+            Error::RustError(format!("Socket builder failed for {}:{}: {}", addr, port, e))
         })?;
 
         remote_socket.opened().await.map_err(|e| {
-            Error::RustError(e.to_string())
+            Error::RustError(format!("Socket connect failed to {}:{}: {}", addr, port, e))
         })?;
 
         tokio::io::copy_bidirectional(self, &mut remote_socket)
             .await
             .map_err(|e| {
-                Error::RustError(e.to_string())
+                Error::RustError(format!("copy_bidirectional error: {}", e))
             })?;
-        // Promptly close the remote socket to release the connection quickly,
-        // reducing overhead on the Workers runtime.
+
         let _ = remote_socket.close().await;
         Ok(())
     }
@@ -108,8 +110,8 @@ impl<'a> ProxyStream<'a> {
 
         let n = self.read(&mut buff).await?;
         let data = &buff[..n];
-        if crate::dns::doh(data).await.is_ok() {
-            self.write(&data).await?;
+        if let Ok(dns_resp) = crate::proxy::dns::doh(data).await {
+            self.write_all(&dns_resp).await?;
         };
         Ok(())
     }
@@ -132,7 +134,9 @@ impl<'a> AsyncRead for ProxyStream<'a> {
 
             match this.events.as_mut().poll_next(cx) {
                 Poll::Ready(Some(Ok(WebsocketEvent::Message(msg)))) => {
-                    msg.bytes().iter().for_each(|x| this.buffer.put_slice(&x));
+                    if let Some(bytes) = msg.bytes() {
+                        this.buffer.put_slice(&bytes);
+                    }
                 }
                 Poll::Pending => return Poll::Pending,
                 _ => return Poll::Ready(Ok(())),
@@ -147,12 +151,12 @@ impl<'a> AsyncWrite for ProxyStream<'a> {
         _: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<tokio::io::Result<usize>> {
-        return Poll::Ready(
+        Poll::Ready(
             self.ws
                 .send_with_bytes(buf)
                 .map(|_| buf.len())
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string())),
-        );
+        )
     }
 
     fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<tokio::io::Result<()>> {
@@ -160,6 +164,7 @@ impl<'a> AsyncWrite for ProxyStream<'a> {
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<tokio::io::Result<()>> {
-        unimplemented!()
+        let _ = self.ws.close(Some(1000), Some("Normal Closure"));
+        Poll::Ready(Ok(()))
     }
 }

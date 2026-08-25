@@ -11,8 +11,8 @@ use worker::*;
 use once_cell::sync::Lazy;
 use regex::Regex;
 
-static PROXYIP_PATTERN: Lazy<Regex> = Lazy::new(|| Regex::new(r"^.+-\d+$").unwrap());
-static PROXYKV_PATTERN: Lazy<Regex> = Lazy::new(|| Regex::new(r"^([A-Z]{2})").unwrap());
+
+static PROXYKV_PATTERN: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)^([A-Z]{2}|ALL)").unwrap());
 
 /// URL of the upstream `proxy_kv` relay list, cached in the `SIREN` KV namespace.
 static PROXY_KV_URL: &str =
@@ -55,25 +55,27 @@ async fn main(req: Request, env: Env, _: Context) -> Result<Response> {
     let uuid = env
         .var("UUID")
         .map(|x| Uuid::parse_str(&x.to_string()).unwrap_or_default())?;
-    let host = req.url()?.host().map(|x| x.to_string()).unwrap_or_default();
+    let _host = req.url()?.host().map(|x| x.to_string()).unwrap_or_default();
     let main_page_url = env.var("MAIN_PAGE_URL").map(|x| x.to_string()).unwrap();
     let sub_page_url = env.var("SUB_PAGE_URL").map(|x| x.to_string()).unwrap();
     let link_page_url = env.var("LINK_PAGE_URL").map(|x| x.to_string()).unwrap();
     let converter_page_url = env.var("CONVERTER_PAGE_URL").map(|x| x.to_string()).unwrap();
     let checker_page_url = env.var("CHECKER_PAGE_URL").map(|x| x.to_string()).unwrap();
 
+    // Default upstream proxy IP fallback if not explicitly routed
+    let default_proxy_addr = env.var("DEFAULT_PROXY_IP").map(|x| x.to_string()).unwrap_or_else(|_| "104.18.2.161".to_string());
+    let default_proxy_port = env.var("DEFAULT_PROXY_PORT").map(|x| x.to_string().parse::<u16>().unwrap_or(443)).unwrap_or(443);
+
     let config = Config {
         uuid,
-        proxy_addr: host,
-        proxy_port: 443,
+        proxy_addr: default_proxy_addr,
+        proxy_port: default_proxy_port,
         main_page_url,
         sub_page_url,
         link_page_url,
         converter_page_url,
         checker_page_url,
-
     };
-
 
     let url = req.url()?;
     let path = url.path();
@@ -84,6 +86,12 @@ async fn main(req: Request, env: Env, _: Context) -> Result<Response> {
         return handle_js_file(req).await;
     } else if path.starts_with("/images/") {
         return handle_image_file(req).await;
+    }
+
+    // Direct WebSocket upgrade checks for any general path
+    let upgrade = req.headers().get("Upgrade")?.unwrap_or_default();
+    if upgrade.eq_ignore_ascii_case("websocket") {
+        return handle_ws_tunnel(req, env, config).await;
     }
 
     Router::with_data(config)
@@ -111,6 +119,7 @@ async fn handle_css_file(req: Request) -> Result<Response> {
         let css = res.text().await?;
         let headers = Headers::new();
         headers.set("Content-Type", "text/css")?;
+        headers.set("Cache-Control", "public, max-age=86400")?;
         Ok(Response::ok(css)?.with_headers(headers))
     } else {
         Response::error("CSS file not found", 404)
@@ -129,6 +138,7 @@ async fn handle_js_file(req: Request) -> Result<Response> {
         let js = res.text().await?;
         let headers = Headers::new();
         headers.set("Content-Type", "application/javascript")?;
+        headers.set("Cache-Control", "public, max-age=86400")?;
         Ok(Response::ok(js)?.with_headers(headers))
     } else {
         Response::error("JavaScript file not found", 404)
@@ -142,7 +152,7 @@ async fn handle_image_file(req: Request) -> Result<Response> {
 
     let mut req_init = RequestInit::new();
     let cf_props = CfProperties {
-        cache_ttl: Some(86400), // Cache for 24 hours
+        cache_ttl: Some(86400),
         ..Default::default()
     };
     req_init.with_cf_properties(cf_props);
@@ -174,7 +184,6 @@ async fn handle_image_file(req: Request) -> Result<Response> {
 
 async fn get_response_from_url(url: String) -> Result<Response> {
     let req = Request::new(url.as_str(), Method::Get)?;
-
     let mut res = Fetch::Request(req).send().await?;
     Response::from_html(res.text().await?)
 }
@@ -199,16 +208,6 @@ async fn checker(_: Request, cx: RouteContext<Config>) -> Result<Response> {
     get_response_from_url(cx.data.checker_page_url.clone()).await
 }
 
-/// `GET /check` — probe proxy relays for liveness and return a JSON report.
-///
-/// Query parameters:
-/// - `cc`    : restrict the sweep to a single country code (e.g. `ID`). When
-///             omitted, relays are drawn from all countries.
-/// - `limit` : max number of relays to probe in this request (default 20, hard
-///             cap 50). Guards against exceeding Workers CPU/wall budgets.
-/// - `timeout`: per-relay connect deadline in ms (default 2000, lower for faster sweep).
-///
-/// Returns `{ "checked", "alive", "results": [{ addr, port, alive, latency_ms }] }`.
 async fn check(req: Request, cx: RouteContext<Config>) -> Result<Response> {
     let query: HashMap<String, String> = req
         .url()?
@@ -232,18 +231,15 @@ async fn check(req: Request, cx: RouteContext<Config>) -> Result<Response> {
     let kv = cx.kv("SIREN")?;
     let proxy_kv = load_proxy_kv(&kv).await?;
 
-    // Collect candidate relay entries from the requested countries.
     let entries: Vec<String> = match &cc {
-        Some(code) => proxy_kv
+        Some(code) if code != "ALL" => proxy_kv
             .get(code)
             .cloned()
             .unwrap_or_default()
             .into_iter()
             .take(limit)
             .collect(),
-        None => {
-            // Round-robin across countries so the sweep samples breadth-first
-            // instead of draining one country entirely before the next.
+        _ => {
             let columns: Vec<&Vec<String>> = proxy_kv.values().collect();
             let mut picked = Vec::new();
             let mut i = 0;
@@ -284,8 +280,6 @@ async fn check(req: Request, cx: RouteContext<Config>) -> Result<Response> {
         }));
     }
 
-    // Bounded concurrency: 8 in-flight connects keeps us within Workers'
-    // outbound-socket guidance while still parallelizing the sweep.
     let results = probe_all(targets, 8, timeout_ms).await;
     let alive = results.iter().filter(|r| r.alive).count();
 
@@ -296,18 +290,6 @@ async fn check(req: Request, cx: RouteContext<Config>) -> Result<Response> {
     }))
 }
 
-/// `GET /check/single` — probe ONE arbitrary `ip:port` (or `host:port`) for
-/// TCP-connect liveness. Unlike `/check` (a batch sweep over the KV relay
-/// list), this takes a specific target so the link/sub pages can ask
-/// "is *this* proxy reachable?".
-///
-/// Query parameters:
-/// - `target` : `ip:port` (or `[ipv6]:port`). Preferred form.
-/// - `ip`     : host/ip, used together with `port` as an alternative to `target`.
-/// - `port`   : port number, paired with `ip`.
-/// - `timeout`: connect deadline in ms (default 2000, min 500).
-///
-/// Returns `{ addr, port, alive, latency_ms }`.
 async fn check_single(req: Request, _: RouteContext<Config>) -> Result<Response> {
     let query: HashMap<String, String> = req
         .url()?
@@ -321,7 +303,6 @@ async fn check_single(req: Request, _: RouteContext<Config>) -> Result<Response>
         .unwrap_or(2000)
         .max(500);
 
-    // Accept either `?target=ip:port` or `?ip=host&port=N`.
     let target_str = match query.get("target") {
         Some(t) => t.clone(),
         None => match (query.get("ip"), query.get("port")) {
@@ -347,48 +328,78 @@ async fn check_single(req: Request, _: RouteContext<Config>) -> Result<Response>
     }
 }
 
-async fn tunnel(req: Request, mut cx: RouteContext<Config>) -> Result<Response> {
-    let mut proxyip = match cx.param("proxyip") {
-        Some(p) => p.to_string(),
-        None => return Response::error("Missing proxyip parameter", 400),
+async fn handle_ws_tunnel(req: Request, env: Env, mut config: Config) -> Result<Response> {
+    let url = req.url()?;
+    let path = url.path().trim_start_matches('/').to_string();
+
+    let mut proxyip = if path.is_empty() {
+        "ALL".to_string()
+    } else {
+        path
     };
-    if PROXYKV_PATTERN.is_match(&proxyip) {
-        let kvid_list: Vec<String> = proxyip.split(",").map(|s| s.to_string()).collect();
-        let kv = cx.kv("SIREN")?;
-        let proxy_kv = load_proxy_kv(&kv).await?;
-        let mut rand_buf = [0u8, 1];
-        getrandom::getrandom(&mut rand_buf).expect("failed generating random number");
 
-        let kv_index = (rand_buf[0] as usize) % kvid_list.len();
-        proxyip = kvid_list[kv_index].clone();
+    let kv_res = env.kv("SIREN");
+    if let Ok(kv) = kv_res {
+        if let Ok(proxy_kv) = load_proxy_kv(&kv).await {
+            let upper = proxyip.to_uppercase();
+            if upper == "ALL" {
+                let all_ips: Vec<String> = proxy_kv.values().flatten().cloned().collect();
+                if !all_ips.is_empty() {
+                    let mut rand_buf = [0u8; 2];
+                    let _ = getrandom::getrandom(&mut rand_buf);
+                    let idx = ((rand_buf[0] as usize) << 8 | (rand_buf[1] as usize)) % all_ips.len();
+                    proxyip = all_ips[idx].replace(':', "-");
+                }
+            } else if PROXYKV_PATTERN.is_match(&proxyip) {
+                let kvid_list: Vec<String> = upper.split(',').map(|s| s.trim().to_string()).collect();
+                let mut rand_buf = [0u8; 2];
+                let _ = getrandom::getrandom(&mut rand_buf);
+                let kv_index = (rand_buf[0] as usize) % kvid_list.len();
+                let selected_cc = &kvid_list[kv_index];
 
-        let proxyip_index = (rand_buf[0] as usize) % proxy_kv[&proxyip].len();
-        proxyip = proxy_kv[&proxyip][proxyip_index].clone().replace(":", "-");
-    }
-
-    if PROXYIP_PATTERN.is_match(&proxyip) {
-        if let Some((addr, port_str)) = proxyip.split_once('-') {
-            if let Ok(port) = port_str.parse() {
-                cx.data.proxy_addr = addr.to_string();
-                cx.data.proxy_port = port;
+                if let Some(list) = proxy_kv.get(selected_cc) {
+                    if !list.is_empty() {
+                        let proxyip_index = (rand_buf[1] as usize) % list.len();
+                        proxyip = list[proxyip_index].clone().replace(':', "-");
+                    }
+                }
             }
         }
     }
 
-    let upgrade = req.headers().get("Upgrade")?.unwrap_or("".to_string());
-    if upgrade == "websocket" {
-        let WebSocketPair { server, client } = WebSocketPair::new()?;
-        server.accept()?;
-
-        wasm_bindgen_futures::spawn_local(async move {
-            let events = server.events().unwrap();
-            if let Err(e) = ProxyStream::new(cx.data, &server, events).process().await {
-                console_log!("[tunnel]: {}", e);
-            }
-        });
-
-        Response::from_websocket(client)
-    } else {
-        Response::from_html("hi from wasm!")
+    // Parse ip-port or ip:port
+    if let Some((addr, port_str)) = proxyip.split_once('-').or_else(|| proxyip.split_once(':')) {
+        if let Ok(port) = port_str.parse::<u16>() {
+            config.proxy_addr = addr.to_string();
+            config.proxy_port = port;
+        }
     }
+
+    let WebSocketPair { server, client } = WebSocketPair::new()?;
+    server.accept()?;
+
+    wasm_bindgen_futures::spawn_local(async move {
+        let events = match server.events() {
+            Ok(ev) => ev,
+            Err(e) => {
+                console_log!("[tunnel]: failed to get ws events: {}", e);
+                return;
+            }
+        };
+        if let Err(e) = ProxyStream::new(config, &server, events).process().await {
+            console_log!("[tunnel]: {}", e);
+        }
+    });
+
+    Response::from_websocket(client)
+}
+
+async fn tunnel(req: Request, cx: RouteContext<Config>) -> Result<Response> {
+    let upgrade = req.headers().get("Upgrade")?.unwrap_or_default();
+    if upgrade.eq_ignore_ascii_case("websocket") {
+        let env = cx.env;
+        return handle_ws_tunnel(req, env, cx.data).await;
+    }
+
+    Response::from_html("NixGen Proxy Tunnel Ready")
 }
