@@ -37,8 +37,8 @@ impl<'a> ProxyStream<'a> {
             // Write VLESS response header (version 0, addon length 0)
             self.write_all(&[0u8, 0u8]).await?;
 
-            // Relay out: if proxy_addr is configured, route via proxy relay;
-            // otherwise route directly to target address.
+            // Determine target: If proxy relay is configured, connect to relay;
+            // Otherwise connect DIRECTLY to requested remote destination.
             let (target_addr, target_port) = if !self.config.proxy_addr.is_empty() {
                 (self.config.proxy_addr.clone(), self.config.proxy_port)
             } else {

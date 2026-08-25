@@ -53,20 +53,11 @@ async fn main(req: Request, env: Env, _: Context) -> Result<Response> {
         .map(|x| Uuid::parse_str(&x.to_string()).unwrap_or_default())
         .unwrap_or_default();
 
-    // Default upstream proxy IP fallback if not explicitly routed
-    let default_proxy_addr = env
-        .var("DEFAULT_PROXY_IP")
-        .map(|x| x.to_string())
-        .unwrap_or_else(|_| "104.18.2.161".to_string());
-    let default_proxy_port = env
-        .var("DEFAULT_PROXY_PORT")
-        .map(|x| x.to_string().parse::<u16>().unwrap_or(443))
-        .unwrap_or(443);
-
+    // Default: Empty proxy_addr means pure direct connect unless an explicit relay path is requested
     let config = Config {
         uuid,
-        proxy_addr: default_proxy_addr,
-        proxy_port: default_proxy_port,
+        proxy_addr: String::new(),
+        proxy_port: 0,
     };
 
     // Any WebSocket upgrade -> Handle Tunneling Directly
@@ -240,46 +231,44 @@ async fn handle_ws_tunnel(req: Request, env: Env, mut config: Config) -> Result<
     let url = req.url()?;
     let path = url.path().trim_start_matches('/').to_string();
 
-    let mut proxyip = if path.is_empty() {
-        "ALL".to_string()
-    } else {
-        path
-    };
-
-    let kv_res = env.kv("SIREN");
-    if let Ok(kv) = kv_res {
-        if let Ok(proxy_kv) = load_proxy_kv(&kv).await {
-            let upper = proxyip.to_uppercase();
-            if upper == "ALL" {
-                let all_ips: Vec<String> = proxy_kv.values().flatten().cloned().collect();
-                if !all_ips.is_empty() {
+    // If path is specified and not direct/root, parse custom relay ip-port
+    if !path.is_empty() && path != "direct" && path != "vless" {
+        let mut proxyip = path;
+        let kv_res = env.kv("SIREN");
+        if let Ok(kv) = kv_res {
+            if let Ok(proxy_kv) = load_proxy_kv(&kv).await {
+                let upper = proxyip.to_uppercase();
+                if upper == "ALL" {
+                    let all_ips: Vec<String> = proxy_kv.values().flatten().cloned().collect();
+                    if !all_ips.is_empty() {
+                        let mut rand_buf = [0u8; 2];
+                        let _ = getrandom::getrandom(&mut rand_buf);
+                        let idx = ((rand_buf[0] as usize) << 8 | (rand_buf[1] as usize)) % all_ips.len();
+                        proxyip = all_ips[idx].replace(':', "-");
+                    }
+                } else if PROXYKV_PATTERN.is_match(&proxyip) {
+                    let kvid_list: Vec<String> = upper.split(',').map(|s| s.trim().to_string()).collect();
                     let mut rand_buf = [0u8; 2];
                     let _ = getrandom::getrandom(&mut rand_buf);
-                    let idx = ((rand_buf[0] as usize) << 8 | (rand_buf[1] as usize)) % all_ips.len();
-                    proxyip = all_ips[idx].replace(':', "-");
-                }
-            } else if PROXYKV_PATTERN.is_match(&proxyip) {
-                let kvid_list: Vec<String> = upper.split(',').map(|s| s.trim().to_string()).collect();
-                let mut rand_buf = [0u8; 2];
-                let _ = getrandom::getrandom(&mut rand_buf);
-                let kv_index = (rand_buf[0] as usize) % kvid_list.len();
-                let selected_cc = &kvid_list[kv_index];
+                    let kv_index = (rand_buf[0] as usize) % kvid_list.len();
+                    let selected_cc = &kvid_list[kv_index];
 
-                if let Some(list) = proxy_kv.get(selected_cc) {
-                    if !list.is_empty() {
-                        let proxyip_index = (rand_buf[1] as usize) % list.len();
-                        proxyip = list[proxyip_index].clone().replace(':', "-");
+                    if let Some(list) = proxy_kv.get(selected_cc) {
+                        if !list.is_empty() {
+                            let proxyip_index = (rand_buf[1] as usize) % list.len();
+                            proxyip = list[proxyip_index].clone().replace(':', "-");
+                        }
                     }
                 }
             }
         }
-    }
 
-    // Parse ip-port or ip:port
-    if let Some((addr, port_str)) = proxyip.split_once('-').or_else(|| proxyip.split_once(':')) {
-        if let Ok(port) = port_str.parse::<u16>() {
-            config.proxy_addr = addr.to_string();
-            config.proxy_port = port;
+        // Parse ip-port or ip:port
+        if let Some((addr, port_str)) = proxyip.split_once('-').or_else(|| proxyip.split_once(':')) {
+            if let Ok(port) = port_str.parse::<u16>() {
+                config.proxy_addr = addr.to_string();
+                config.proxy_port = port;
+            }
         }
     }
 
